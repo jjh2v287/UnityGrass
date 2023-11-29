@@ -1,0 +1,7 @@
+﻿.vs
+bin/Grass_BurstDebugInformation_DoNotShip
+bin/Grass_BackUpThisFolder_ButDontShipItWithYourGame
+Library
+Logs
+obj
+Temp

@@ -1,0 +1,259 @@
+﻿
+#pragma kernel Main
+
+
+#define PI          3.14159265358979323846
+#define TWO_PI      6.28318530717958647693
+
+// 마우스로 찍은 위치의 정보
+struct SourceVertex
+{
+    float3 positionOS;
+    float3 normalOS;
+    float2 uv;
+    float3 color;
+};
+// 참조만 함으로 읽기만 가능한 StructuredBuffer로 설정
+StructuredBuffer<SourceVertex> _SourceVertices;
+
+// 그려질 정점 정보
+struct DrawVertex
+{
+    float3 positionWS;
+    float2 uv;
+    float3 diffuseColor;
+};
+// 그려질 트라이앵글 정부
+struct DrawTriangle
+{
+    float3 normalOS;
+    DrawVertex vertices[3]; // 삼각형의 세 점
+};
+// GPU에서 추가를 해야하는 정보라서 AppendStructuredBuffer로 설정
+AppendStructuredBuffer<DrawTriangle> _DrawTriangles;
+
+// 메시의 종합 데이터 Graphics.DrawProceduralIndirect(bufferWithArgs argsOffset)
+struct IndirectArgs
+{
+    //인스턴스당 인덱스 수
+    uint numVerticesPerInstance;
+    // 인스턴스 수
+    uint numInstances;
+    // 시작 인덱스 위치
+    uint startVertexIndex;
+    // 기본 정점 위치 및 시작 인스턴스 위치
+    uint startInstanceIndex;
+};
+// 커널은 꼭지점의 수를 계산하므로 RWStructuredBuffer으로 설정
+RWStructuredBuffer<IndirectArgs> _IndirectArgsBuffer;
+
+#define GRASS_BLADES 4  // 마우스로 찍은 위치에 몃개의 풀잎을 생성할지
+#define GRASS_SEGMENTS 5  // 풀잎 하나를 그릴때 밑에서 위로 까지 그려질 단계
+#define GRASS_NUM_VERTICES_PER_BLADE (GRASS_SEGMENTS * 2 + 1)
+/*
+    #     GRASS_SEGMENTS 5
+   ###    GRASS_SEGMENTS 4
+  #####   GRASS_SEGMENTS 3
+ #######  GRASS_SEGMENTS 2
+######### GRASS_SEGMENTS 1
+GRASS_SEGMENTS 5번은 정점 하나만 있어서 된다.
+GRASS_SEGMENTS 5번아래는 삼각형이 2두개
+
+# <- 한개가 정점
+       #
+      # #
+      # #
+    #     #
+    #     #  
+  #         #
+  #         #
+#             #
+#             #
+*/
+
+// ----------------------------------------
+
+int _NumSourceVertices;
+
+float4x4 _LocalToWorld;
+
+float _Time;
+
+half _GrassHeight;
+half _GrassWidth;
+float _GrassRandomHeight;
+
+half _WindSpeed;
+float _WindStrength;
+
+half _InteractorRadius, _InteractorStrength;
+
+half _BladeRadius;
+float _BladeForward;
+float _BladeCurve;
+int _MaxBladesPerVertex;
+int _MaxSegmentsPerBlade;
+
+float _MinFadeDist, _MaxFadeDist;
+
+uniform float3 _PositionMoving;
+uniform float3 _CameraPositionWS;
+uniform float3 _CameraForward;
+
+
+// -------------- Helper -------------- //
+float rand(float3 co)
+{
+    return frac(
+    sin(dot(co.xyz, float3(12.9898, 78.233, 53.539))) * 43758.5453);
+}
+
+// 점을 회전시키는 회전 행렬을 계산하는 함수
+// 주어진 축 주위의 각도 라디안 기준
+float3x3 AngleAxis3x3(float angle, float3 axis)
+{
+    float c, s;
+    sincos(angle, s, c);
+
+    float t = 1 - c;
+    float x = axis.x;
+    float y = axis.y;
+    float z = axis.z;
+
+    return float3x3(
+    t * x * x + c, t * x * y - s * z, t * x * z + s * y,
+    t * x * y + s * z, t * y * y + c, t * y * z - s * x,
+    t * x * z - s * y, t * y * z + s * x, t * z * z + c);
+}
+
+// 삼각형에 대한 각 잔디 정점 생성
+DrawVertex GrassVertex(float3 positionOS, float width, float height,
+float offset, float curve, float2 uv, float3x3 rotation, float3 color)
+{
+    DrawVertex output = (DrawVertex)0;
+    
+    float3 newPosOS = positionOS + mul(rotation, float3(width, height, curve) + float3(0, 0, offset));
+    output.positionWS = mul(_LocalToWorld, float4(newPosOS, 1)).xyz;
+    output.uv = uv;
+    output.diffuseColor = color;
+    return output;
+}
+// -------------- Helper -------------- //
+
+[numthreads(128, 1, 1)]
+void Main(uint3 id : SV_DispatchThreadID)
+{
+    // 모든 삼각형이 처리된 경우 반환
+    if ((int)id.x >= _NumSourceVertices)
+    {
+        return;
+    }
+    
+    SourceVertex sv = _SourceVertices[id.x];
+
+    float forward =  _BladeForward;
+    
+    float3 perpendicularAngle = float3(0, 0, 1);
+    float3 faceNormal = cross(perpendicularAngle, sv.normalOS);
+    float3 worldPos = mul(_LocalToWorld, float4(sv.positionOS, 1)).xyz;
+
+    // 카메러 거리에 비례해서 컬링
+    float distanceFromCamera = distance(worldPos, _CameraPositionWS);
+    float distanceFade = 1 - saturate((distanceFromCamera - _MinFadeDist) / (_MaxFadeDist - _MinFadeDist));
+    // float distanceFade = 1 - saturate((distanceFromCamera - _MinFadeDist) / _MaxFadeDist);  // original
+
+    // Frustum culling
+    //distanceFade를 카메라 각안에 있으면 1 각을 벗어나면 0, 0으로 만드는게 중요
+    float angle = dot(_CameraForward, normalize(worldPos));
+    if (angle <= 1.0f)
+    {
+    }
+        //distanceFade = 10.0f;
+    
+    // 바람 백터 계산
+    float3 v0 = sv.positionOS.xyz;
+    float3 wind1 = float3(
+    sin(_Time.x * _WindSpeed + v0.x) + sin(
+    _Time.x * _WindSpeed + v0.z * 2) + sin(
+    _Time.x * _WindSpeed * 0.1 + v0.x), 0,
+    cos(_Time.x * _WindSpeed + v0.x * 2) + cos(
+    _Time.x * _WindSpeed + v0.z));
+
+    wind1 *= _WindStrength;
+
+    // 인터렉티브
+    float3 dis = distance(_PositionMoving, worldPos);
+    float3 radius = 1 - saturate(dis / _InteractorRadius);
+    float3 sphereDisp = worldPos - _PositionMoving; 
+    sphereDisp *= radius;
+    sphereDisp = clamp(sphereDisp.xyz * _InteractorStrength, -0.8, 0.8);
+
+    // 버텍스 컬러 설정
+    float3 color = sv.color;
+    
+    // 잔디 높이값 설정
+    _GrassWidth *= sv.uv.x;  // UV.x == width multiplier (set in GeometryGrassPainter.cs)
+    _GrassHeight *= sv.uv.y;  // UV.y == height multiplier (set in GeometryGrassPainter.cs) 
+    _GrassHeight *= clamp(rand(sv.positionOS.xyz), 1 - _GrassRandomHeight, 1 + _GrassRandomHeight);
+
+    int numBladesPerVertex = min(GRASS_BLADES, max(1, _MaxBladesPerVertex));
+    int numSegmentsPerBlade = min(GRASS_SEGMENTS, max(1, _MaxSegmentsPerBlade));
+    int numTrianglesPerBlade = (numSegmentsPerBlade - 1) * 2 + 1;
+    DrawVertex drawVertices[GRASS_NUM_VERTICES_PER_BLADE];
+
+    for (int j = 0; j < numBladesPerVertex * distanceFade; ++j)
+    {
+        // 블레이드의 회전 및 반경 설정
+        float3x3 facingRotationMatrix = AngleAxis3x3(rand(sv.positionOS.xyz) * TWO_PI + j, float3(0, 1, -0.1));
+        float3x3 transformationMatrix = facingRotationMatrix;
+        float bladeRadius = j / (float) numBladesPerVertex;
+        float offset = (1 - bladeRadius) * _BladeRadius;
+
+        for (int i = 0; i < numSegmentsPerBlade; ++i)
+        {
+            // 테이퍼 너비, 증가 높이
+            float t = i / (float) numSegmentsPerBlade;
+            float segmentHeight = _GrassHeight * t;
+            float segmentWidth = _GrassWidth * (1 - t);
+
+            // 첫 번째(0) 잔디 세그먼트가 더 얇음.
+            segmentWidth = i == 0 ? _GrassWidth * 0.3 : segmentWidth;
+
+            float segmentForward = pow(abs(t), _BladeCurve) * forward;
+
+            // 잔디의 첫 번째 세그먼트 행렬 설정(그냥 같은걸로...)
+            float3x3 transformMatrix = (i == 0) ? facingRotationMatrix : transformationMatrix;
+
+            // 잔디의 첫 번째 세그먼트는 인터랙티브에 적용이 안됨
+            float3 newPos = (i == 0) ? v0 : v0 + (float3(sphereDisp.x, sphereDisp.y, sphereDisp.z) + wind1) * t;
+            
+            // 첫 번째 정점 추가
+            drawVertices[i * 2] = GrassVertex(newPos, segmentWidth, segmentHeight, offset, segmentForward, float2(0, t), transformMatrix, color);
+
+            // 두 번째 정점 추가
+            drawVertices[i * 2 + 1] = GrassVertex(newPos, -segmentWidth, segmentHeight, offset, segmentForward, float2(1, t), transformMatrix, color);
+        }
+        // 맨위 정점 추가
+        float3 topPosOS = v0 + float3(sphereDisp.x * 1.2, sphereDisp.y, sphereDisp.z * 1.2) + wind1;
+        drawVertices[numSegmentsPerBlade * 2] = GrassVertex(topPosOS, 0, _GrassHeight, offset, forward, float2(0.5, 1), transformationMatrix, color);
+        
+        // 트라이앵글 추가
+        for (int k = 0; k < numTrianglesPerBlade; ++k)
+        {
+            DrawTriangle tri = (DrawTriangle)0;
+            tri.normalOS = faceNormal;
+            tri.vertices[0] = drawVertices[k];
+            tri.vertices[1] = drawVertices[k + 1];
+            tri.vertices[2] = drawVertices[k + 2];
+            _DrawTriangles.Append(tri);
+        }
+        
+    }
+    
+    // InterlockedAdd(a, b)는 a에 b를 더하고 값을 a에 저장 스레드로부터 안전
+    // 호출은 정점의 수를 세어 indirectarguments에 저장
+    // 이건 렌더러에게 DrawProcedural의 메시에 얼마나 정점이 있는지 알려준다
+    
+    // InterlockedAdd(_IndirectArgsBuffer[0].numVerticesPerInstance, 3);
+    InterlockedAdd(_IndirectArgsBuffer[0].numVerticesPerInstance, numTrianglesPerBlade * numBladesPerVertex * 3);
+}

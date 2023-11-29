@@ -1,0 +1,175 @@
+#pragma kernel GrassCulling
+
+uint grassCount;
+uint depthTextureSizeW;
+uint depthTextureSizeH;
+StructuredBuffer<float4> grassMatrixBuffer;
+bool isOpenGL;
+
+float4x4 vpMatrix;
+float4x4 _LocalToWorld;
+AppendStructuredBuffer<float4> cullResultBuffer;
+uniform Texture2D<float> hizTexture;
+uniform SamplerState sampler_hizTexture; // 변수 이름은 hizTexture을 참조하기 위해 컴파일러에 의해 인식됩니다.
+
+float range;
+
+static float3 boundMin = float3(-0.2f, 0.0f, -0.00001f);
+static float3 boundMax = float3(0.2f, 0.5f, 0.001f);
+
+bool IsInClipSpace(float4 clipSpacePosition)
+{
+    if (isOpenGL)
+        return clipSpacePosition.x > -clipSpacePosition.w && clipSpacePosition.x < clipSpacePosition.w &&
+        clipSpacePosition.y > -clipSpacePosition.w && clipSpacePosition.y < clipSpacePosition.w &&
+        clipSpacePosition.z > -clipSpacePosition.w && clipSpacePosition.z < clipSpacePosition.w;
+    else
+        return clipSpacePosition.x > -clipSpacePosition.w && clipSpacePosition.x < clipSpacePosition.w &&
+        clipSpacePosition.y > -clipSpacePosition.w && clipSpacePosition.y < clipSpacePosition.w &&
+        clipSpacePosition.z > 0 && clipSpacePosition.z < clipSpacePosition.w;
+}
+
+uint FrustumCull(float4 clipPos) {
+    return(clipPos.z > clipPos.w
+        || clipPos.z < -clipPos.w
+        || clipPos.x < -clipPos.w + /*_FrustumCullEdgeOffset*/ -2
+        || clipPos.x > clipPos.w - /*_FrustumCullEdgeOffset*/ -2
+        || clipPos.y < -clipPos.w + /*_FrustumCullNearOffset*/ -5
+        || clipPos.y > clipPos.w)
+        ? 0 : 1;
+}
+
+[numthreads(640, 1, 1)]
+void GrassCulling(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= grassCount)
+        return;
+
+    float4 grassMatrix = grassMatrixBuffer[id.x];
+
+    float4 worldPos = mul(_LocalToWorld, float4(grassMatrix.xyz, 1));
+
+    float4 mvpMatrix = mul(vpMatrix, worldPos);
+
+    float4 boundVerts[8];
+    boundVerts[0] = float4(boundMin, 1);
+    boundVerts[1] = float4(boundMax, 1);
+    boundVerts[2] = float4(boundMax.x, boundMax.y, boundMin.z, 1);
+    boundVerts[3] = float4(boundMax.x, boundMin.y, boundMax.z, 1);
+    boundVerts[4] = float4(boundMax.x, boundMin.y, boundMin.z, 1);
+    boundVerts[5] = float4(boundMin.x, boundMax.y, boundMax.z, 1);
+    boundVerts[6] = float4(boundMin.x, boundMax.y, boundMin.z, 1);
+    boundVerts[7] = float4(boundMin.x, boundMin.y, boundMax.z, 1);
+
+    float minX = 1, minY = 1, minZ = 1, maxX = -1, maxY = -1, maxZ = -1;
+
+    //-------------------------------------------------------?椎剔除-------------------------------------------------------
+    bool isInClipSpace = false;
+    for (int i = 0; i < 8; i++)
+    {
+        float4 clipSpace = mul(mvpMatrix, boundVerts[i]);
+        if (!isInClipSpace && FrustumCull(mvpMatrix))
+            isInClipSpace = true;
+
+        float3 ndc = clipSpace.xyz / clipSpace.w;
+        if (minX > ndc.x)
+            minX = ndc.x;
+        if (minY > ndc.y)
+            minY = ndc.y;
+        if (minZ > ndc.z)
+            minZ = ndc.z;
+        if (maxX < ndc.x)
+            maxX = ndc.x;
+        if (maxY < ndc.y)
+            maxY = ndc.y;
+        if (maxZ < ndc.z)
+            maxZ = ndc.z;
+    }
+    if (!isInClipSpace)
+        return;
+
+    //-------------------------------------------------------Hi-z 컬링-------------------------------------------------------
+    float2 uvLeftBottom = float2(minX, minY) * 0.5f + 0.5f;
+    float2 uvRightTop = float2(maxX, maxY) * 0.5f + 0.5f;
+
+    float depth = minZ;
+
+
+    if (isOpenGL)
+    {
+        depth = minZ;
+        depth = depth * 0.5f + 0.5f;
+    }
+    depth = depth * 0.5f + 0.5f;
+
+    int numLevels = 1 + (int)floor(log2(max(depthTextureSizeW, depthTextureSizeH)));
+    float3 ndc2 = mvpMatrix.xyz / mvpMatrix.w;
+    uint mipmapLevel = (uint) clamp(depthTextureSizeW * 2 / log2(max(maxX - minX, maxY - minY)), 0, log2(depthTextureSizeH) - 4);
+    float2 uv = float2(ndc2.x, ndc2.y) * 0.5f + 0.5f;
+    float depthInTexture1 = hizTexture[uv];
+
+    float LOD = ceil(log2(max(depthTextureSizeW, depthTextureSizeH) / pow(2, /*occlusionAccuracy*/1)));
+    depthInTexture1 = hizTexture.SampleLevel(sampler_hizTexture, uv, 0).r;
+    if (1 - depthInTexture1 < ndc2.z) // 0 ~ 1
+        return;
+
+    //int IsCull = 0;
+    //float2 coner[4];
+    //coner[0] = float2(-0.5f, 0.0f) * grassMatrix.w;
+    //coner[1] = float2(-0.5f, 0.5f) * grassMatrix.w;
+    //coner[2] = float2(0.5f, 0.0f) * grassMatrix.w;
+    //coner[3] = float2(0.5f, 0.5f) * grassMatrix.w;
+    //for (int i = 0; i < 4; i++)
+    //{
+    //    float4 worldPos2 = mul(_LocalToWorld, float4(coner[0], 0, 0) + grassMatrix);
+    //    float4 mvpMatrix2 = mul(vpMatrix, worldPos2);
+    //    float3 ndc3 = mvpMatrix2.xyz / mvpMatrix2.w;
+    //    float2 uv2 = float2(ndc3.x, ndc3.y) * 0.5f + 0.5f;
+    //    depthInTexture1 = hizTexture.SampleLevel(sampler_hizTexture, uv2, 0).r;
+    //    if (1 - depthInTexture1 < ndc3.z) // 0 ~ 1
+    //        IsCull += 1;
+    //}
+    //if (IsCull == 4)
+    //    return;
+
+    uint sizew = depthTextureSizeW / (1 << mipmapLevel);
+    uint sizeh = depthTextureSizeH / (1 << mipmapLevel);
+    
+
+    uint2 pixelLeftBottom = uint2(clamp(uvLeftBottom.x * sizew, 0, sizew - 1), clamp(uvLeftBottom.y * sizeh, 0, sizeh - 1));
+    uint2 pixelRightTop = uint2(clamp(uvRightTop.x * sizew, 0, sizew - 1), clamp(uvRightTop.y * sizeh, 0, sizeh - 1));
+
+    float depthInTexture = hizTexture.mips[mipmapLevel][pixelLeftBottom].r;
+    if (isOpenGL)
+    {
+        if (pixelLeftBottom.x < pixelRightTop.x && pixelLeftBottom.y < pixelRightTop.y)
+        {
+            depthInTexture = max(max(depthInTexture, hizTexture.mips[mipmapLevel][pixelRightTop].r),
+                max(hizTexture.mips[mipmapLevel][int2(pixelLeftBottom.x, pixelRightTop.y)].r, hizTexture.mips[mipmapLevel][int2(pixelRightTop.x, pixelLeftBottom.y)].r));
+        }
+        else if (pixelLeftBottom.x < pixelRightTop.x)
+            depthInTexture = max(depthInTexture, hizTexture.mips[mipmapLevel][int2(pixelRightTop.x, pixelLeftBottom.y)].r);
+        else if (pixelLeftBottom.y < pixelRightTop.y)
+            depthInTexture = max(depthInTexture, hizTexture.mips[mipmapLevel][int2(pixelLeftBottom.x, pixelRightTop.y)].r);
+    
+        if (depthInTexture < depth)
+            return;
+    }
+    else
+    {
+        if (pixelLeftBottom.x < pixelRightTop.x && pixelLeftBottom.y < pixelRightTop.y)
+        {
+            depthInTexture = min(min(depthInTexture, hizTexture.mips[mipmapLevel][pixelRightTop].r),
+                min(hizTexture.mips[mipmapLevel][int2(pixelLeftBottom.x, pixelRightTop.y)].r, hizTexture.mips[mipmapLevel][int2(pixelRightTop.x, pixelLeftBottom.y)].r));
+        }
+        else if (pixelLeftBottom.x < pixelRightTop.x)
+            depthInTexture = min(depthInTexture, hizTexture.mips[mipmapLevel][int2(pixelRightTop.x, pixelLeftBottom.y)].r);
+        else if (pixelLeftBottom.y < pixelRightTop.y)
+            depthInTexture = min(depthInTexture, hizTexture.mips[mipmapLevel][int2(pixelLeftBottom.x, pixelRightTop.y)].r);
+    
+        if (depthInTexture > depth)
+            return;
+    }
+    
+    cullResultBuffer.Append(grassMatrix);
+}
